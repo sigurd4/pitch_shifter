@@ -1,11 +1,14 @@
 #![feature(split_array)]
+#![feature(variant_count)]
+#![feature(array_chunks)]
 
-use std::{sync::Arc, f32::consts::{TAU, PI}};
+use std::{sync::Arc, f64::consts::{TAU, PI}};
 
-use num::Complex;
+use array_math::ArrayMath;
+use num::{Complex, Float, Zero};
 use parameters::{OCTAVES_PER_UNIT_PITCH, PITCH_PER_FINE_PITCH};
 use real_time_fir_iir_filters::{iir::third::ThirdOrderButterworthFilter, Filter};
-use sss_fft::{FFTAlgorithmDefault, SlidingDFT};
+use signal_processing::Sdft;
 use vst::{prelude::*, plugin_main};
 
 use self::parameters::{BasicFilterParameters, Control};
@@ -14,29 +17,87 @@ pub mod parameters;
 
 const WINDOW_LENGTH: usize = 1024;
 
-struct PitchShifterPlugin
-{
-    pub param: Arc<BasicFilterParameters>,
-    filter: [[ThirdOrderButterworthFilter<f32>; 4]; CHANNEL_COUNT],
-    dft: [SlidingDFT<f32, WINDOW_LENGTH>; CHANNEL_COUNT],
-    omega: [f32; CHANNEL_COUNT],
-    rate: f32
-}
+const F_ANTI_POP: f64 = 10000.0;
 
 const CHANNEL_COUNT: usize = 2;
 
+struct PitchShifterPlugin
+{
+    pub param: Arc<BasicFilterParameters>,
+    anti_alias_filter: [[ThirdOrderButterworthFilter<f64>; 4]; CHANNEL_COUNT],
+    anti_pop_filter: [ThirdOrderButterworthFilter<f64>; CHANNEL_COUNT],
+    dft: [([Complex<f64>; WINDOW_LENGTH], Vec<f64>); CHANNEL_COUNT],
+    omega: [f64; CHANNEL_COUNT],
+    pitch_mul: f64,
+    rate: f64
+}
+
 impl PitchShifterPlugin
 {
-    fn ifft_once<const N: usize>(omega: f32, x_f: [Complex<f32>; N]) -> f32
+    fn ifft_once<const N: usize>(omega: f64, x_f: [Complex<f64>; N]) -> f64
     {
         let z = Complex::cis(omega);
         let mut z_n = z;
-        x_f[1..N/2].into_iter()
+        (x_f[0].re + x_f[1..N/2 + 1].into_iter()
             .map(|x_f| {
                 let y = x_f*z_n;
                 z_n *= z;
                 y.re*2.0
-            }).sum::<f32>()/N as f32
+            }).sum::<f64>())/N as f64
+    }
+    
+    fn process<F>(&mut self, buffer: &mut AudioBuffer<F>)
+    where
+        F: Float
+    {
+        let octaves = ((self.param.pitch.get() + self.param.pitch_fine.get()*PITCH_PER_FINE_PITCH)*OCTAVES_PER_UNIT_PITCH) as f64;
+        let pitch_mul = 2.0f64.powf(octaves);
+        let domega_dt = TAU*(pitch_mul - 1.0)/WINDOW_LENGTH as f64;
+
+        let mix = self.param.mix.get() as f64;
+
+        const MARGIN: f64 = 0.2;
+
+        if pitch_mul != self.pitch_mul
+        {
+            let omega_ceil0 = if pitch_mul*2.0f64.powf(MARGIN) > 1.0 {self.rate/pitch_mul*2.0f64.powf(-MARGIN)} else {self.rate}*PI;
+            let omega_ceil1 = if pitch_mul*2.0f64.powf(-MARGIN) < 1.0 {self.rate*pitch_mul*2.0f64.powf(-MARGIN)} else {self.rate}*PI;
+            let omega_floor0 = self.rate/pitch_mul/(WINDOW_LENGTH/8) as f64*TAU*2.0f64.powf(MARGIN);
+            let omega_floor1 = self.rate/(WINDOW_LENGTH/8) as f64*TAU*2.0f64.powf(MARGIN);
+            for [filter_low0, filter_low1, filter_high0, filter_high1] in self.anti_alias_filter.iter_mut()
+            {
+                filter_low0.omega = omega_ceil0;
+                filter_low1.omega = omega_ceil1;
+                filter_high0.omega = omega_floor0;
+                filter_high1.omega = omega_floor1;
+            }
+            self.pitch_mul = pitch_mul;
+        }
+
+        for (((((input_channel, output_channel), [filter_low0, filter_low1, filter_high0, filter_high1]), anti_pop_filter), dft), omega) in buffer.zip()
+            .zip(self.anti_alias_filter.iter_mut())
+            .zip(self.anti_pop_filter.iter_mut())
+            .zip(self.dft.iter_mut())
+            .zip(self.omega.iter_mut())
+        {
+            for (input_sample, output_sample) in input_channel.into_iter()
+                .zip(output_channel.into_iter())
+            {
+                let x = input_sample.to_f64().unwrap();
+                let [z, _, _, _] = filter_low0.filter(self.rate, x);
+                let [_, _, _, z] = filter_high0.filter(self.rate, z);
+                dft.0.sdft(&mut [z], &mut dft.1);
+
+                let y = Self::ifft_once(*omega, dft.0);
+                let [y, _, _, _] = filter_low1.filter(self.rate, y);
+                let [_, _, _, y] = filter_high1.filter(self.rate, y);
+                let [y, _, _, _] = anti_pop_filter.filter(self.rate, y);
+
+                *output_sample = F::from((1.0 - mix)*x + mix*y).unwrap();
+                    
+                *omega = (*omega + domega_dt + TAU) % TAU;
+            }
+        }
     }
 }
 
@@ -53,9 +114,11 @@ impl Plugin for PitchShifterPlugin
                 pitch_fine: AtomicFloat::from(0.0),
                 mix: AtomicFloat::from(1.0)
             }),
-            filter: [(); CHANNEL_COUNT].map(|()| [(); 4].map(|()| ThirdOrderButterworthFilter::new(rate*PI))),
-            dft: [(); CHANNEL_COUNT].map(|()| SlidingDFT::new::<FFTAlgorithmDefault>([0.0; WINDOW_LENGTH])),
+            anti_alias_filter: [(); CHANNEL_COUNT].map(|()| [(); 4].map(|()| ThirdOrderButterworthFilter::new(rate*PI))),
+            anti_pop_filter: [(); CHANNEL_COUNT].map(|()| ThirdOrderButterworthFilter::new(F_ANTI_POP*TAU)),
+            dft: [(); CHANNEL_COUNT].map(|()| ([Complex::zero(); WINDOW_LENGTH], vec![])),
             omega: [0.0; CHANNEL_COUNT],
+            pitch_mul: f64::NAN,
             rate
         }
     }
@@ -66,7 +129,7 @@ impl Plugin for PitchShifterPlugin
             name: "Pitch Shifter".to_string(),
             vendor: "Soma FX".to_string(),
             presets: 0,
-            parameters: Control::CONTROLS.len() as i32,
+            parameters: Control::VARIANTS.len() as i32,
             inputs: CHANNEL_COUNT as i32,
             outputs: CHANNEL_COUNT as i32,
             midi_inputs: 0,
@@ -84,55 +147,22 @@ impl Plugin for PitchShifterPlugin
 
     fn set_sample_rate(&mut self, rate: f32)
     {
-        self.rate = rate;
-    }
-
-    fn process(&mut self, buffer: &mut AudioBuffer<f32>)
-    {
-        let octaves = (self.param.pitch.get() + self.param.pitch_fine.get()*PITCH_PER_FINE_PITCH)*OCTAVES_PER_UNIT_PITCH;
-        let pitch_mul = 2.0f32.powf(octaves);
-        let domega_dt = TAU*(pitch_mul - 1.0)/WINDOW_LENGTH as f32;
-
-        let mix = self.param.mix.get();
-
-        const MARGIN: f32 = 0.2;
-
-        {
-            let omega_ceil0 = if pitch_mul*2.0f32.powf(MARGIN) > 1.0 {self.rate/pitch_mul*2.0f32.powf(-MARGIN)} else {self.rate}*PI;
-            let omega_ceil1 = if pitch_mul*2.0f32.powf(-MARGIN) < 1.0 {self.rate*pitch_mul*2.0f32.powf(-MARGIN)} else {self.rate}*PI;
-            let omega_floor0 = self.rate/pitch_mul/(WINDOW_LENGTH/4) as f32*TAU*2.0f32.powf(MARGIN);
-            let omega_floor1 = self.rate/(WINDOW_LENGTH/4) as f32*TAU*2.0f32.powf(MARGIN);
-            for [filter_low0, filter_low1, filter_high0, filter_high1] in self.filter.iter_mut()
-            {
-                filter_low0.omega = omega_ceil0;
-                filter_low1.omega = omega_ceil1;
-                filter_high0.omega = omega_floor0;
-                filter_high1.omega = omega_floor1;
-            }
-        }
-
-        for ((((input_channel, output_channel), [filter_low0, filter_low1, filter_high0, filter_high1]), dft), omega) in buffer.zip()
-            .zip(self.filter.iter_mut())
-            .zip(self.dft.iter_mut())
-            .zip(self.omega.iter_mut())
-        {
-            for (&input_sample, output_sample) in input_channel.into_iter()
-                .zip(output_channel.into_iter())
-            {
-                let x_f = dft.next(filter_high0.filter(self.rate, filter_low0.filter(self.rate, input_sample)[0])[3]);
-
-                let y = Self::ifft_once(*omega, x_f);
-
-                *output_sample = (1.0 - mix)*input_sample + mix*filter_high1.filter(self.rate, filter_low1.filter(self.rate, y)[0])[3];
-                    
-                *omega = (*omega + domega_dt) % TAU;
-            }
-        }
+        self.rate = rate as f64;
     }
 
     fn get_parameter_object(&mut self) -> Arc<dyn PluginParameters>
     {
         self.param.clone()
+    }
+
+    fn process(&mut self, buffer: &mut AudioBuffer<f32>)
+    {
+        self.process(buffer)
+    }
+
+    fn process_f64(&mut self, buffer: &mut AudioBuffer<f64>)
+    {
+        self.process(buffer)
     }
 }
 

@@ -17,7 +17,8 @@ pub enum Control
 
 impl Control
 {
-    pub const CONTROLS: [Control; 3] = [
+    pub const VARIANT_COUNT: usize = core::mem::variant_count::<Self>();
+    pub const VARIANTS: [Self; Self::VARIANT_COUNT] = [
         Self::Pitch,
         Self::PitchFine,
         Self::Mix
@@ -25,7 +26,7 @@ impl Control
 
     pub fn from(i: i32) -> Self
     {
-        Self::CONTROLS[i as usize]
+        Self::VARIANTS[i as usize]
     }
 }
 
@@ -102,16 +103,13 @@ impl PluginParameters for BasicFilterParameters
     }
 
     fn can_be_automated(&self, index: i32) -> bool {
-        index < Control::CONTROLS.len() as i32
+        index < Control::VARIANTS.len() as i32
     }
 
     fn get_preset_data(&self) -> Vec<u8>
     {
-        [
-            self.pitch.get().to_le_bytes().to_vec(),
-            self.pitch_fine.get().to_le_bytes().to_vec(),
-            self.mix.get().to_le_bytes().to_vec()
-        ].concat()
+        Control::VARIANTS.map(|v| self.get_parameter(v as i32).to_le_bytes())
+            .concat()
     }
 
     fn get_bank_data(&self) -> Vec<u8>
@@ -121,10 +119,11 @@ impl PluginParameters for BasicFilterParameters
 
     fn load_preset_data(&self, data: &[u8])
     {
-        let mut i = 0;
-        self.pitch.set(f32::from_le_bytes(*data[i..].split_array_ref().0)); i += 4;
-        self.pitch_fine.set(f32::from_le_bytes(*data[i..].split_array_ref().0)); i += 4;
-        self.mix.set(f32::from_le_bytes(*data[i..].split_array_ref().0)); i += 4;
+        for (v, &b) in Control::VARIANTS.into_iter()
+            .zip(data.array_chunks())
+        {
+            self.set_parameter(v as i32, f32::from_le_bytes(b));
+        }
     }
 
     fn load_bank_data(&self, data: &[u8])
